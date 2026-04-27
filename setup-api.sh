@@ -1,0 +1,249 @@
+#!/bin/bash
+# ============================================================
+# API Keys Setup Wizard - INPUT LANGSUNG DI TERMINAL KAMU
+# API keys disimpan hanya di local machine kamu
+# ============================================================
+
+GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[1;33m'
+CYAN='\033[0;36m'; MAGENTA='\033[0;35m'; NC='\033[0m'
+
+clear
+cat << "EOF"
+╔══════════════════════════════════════════════════╗
+║          🔐 API KEYS SETUP WIZARD 🔐             ║
+║                                                  ║
+║   API keys akan disimpan AMAN di local kamu:     ║
+║   ~/.config/subfinder/provider-config.yaml       ║
+║                                                  ║
+║   ⚠️  JANGAN share file ini ke siap              ║
+║   ⚠️  JANGAN share file ini ke siapapun!         ║
+╚══════════════════════════════════════════════════╝
+EOF
+
+echo ""
+echo -e "${YELLOW}[!] Tekan ENTER untuk SKIP API yang tidak kamu punya${NC}"
+echo -e "${YELLOW}[!] Bisa di-update kapan saja dengan jalankan script ini lagi${NC}"
+echo ""
+read -p "$(echo -e ${CYAN}Lanjutkan? [y/N]: ${NC})" confirm
+[[ ! $confirm =~ ^[Yy]$ ]] && exit 0
+
+# Buat folder config
+mkdir -p ~/.config/subfinder
+mkdir -p ~/.config/recon
+CONFIG_FILE="$HOME/.config/subfinder/provider-config.yaml"
+RECON_ENV="$HOME/.config/recon/.env"
+
+# Backup jika sudah ada
+if [ -f "$CONFIG_FILE" ]; then
+    cp "$CONFIG_FILE" "${CONFIG_FILE}.backup.$(date +%s)"
+    echo -e "${GREEN}[✓] Backup config lama disimpan${NC}"
+fi
+
+# Function untuk input API key
+input_api() {
+    local service=$1
+    local url=$2
+    local description=$3
+    local var_name=$4
+    
+    echo ""
+    echo -e "${MAGENTA}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${CYAN}▸ ${service}${NC}"
+    echo -e "${YELLOW}  📝 ${description}${NC}"
+    echo -e "${YELLOW}  🔗 Daftar: ${url}${NC}"
+    echo ""
+    read -p "$(echo -e ${GREEN}  API Key [ENTER untuk skip]: ${NC})" -r key
+    
+    if [ -n "$key" ]; then
+        declare -g "$var_name=$key"
+        echo -e "${GREEN}  ✓ Tersimpan${NC}"
+    else
+        echo -e "${YELLOW}  ⊘ Skipped${NC}"
+    fi
+}
+
+# Function untuk input dengan 2 field (Censys: ID + Secret)
+input_api_double() {
+    local service=$1
+    local url=$2
+    local var1=$3
+    local var2=$4
+    
+    echo ""
+    echo -e "${MAGENTA}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${CYAN}▸ ${service}${NC}"
+    echo -e "${YELLOW}  🔗 Daftar: ${url}${NC}"
+    echo ""
+    read -p "$(echo -e ${GREEN}  ${var1} [ENTER skip]: ${NC})" -r v1
+    if [ -n "$v1" ]; then
+        read -p "$(echo -e ${GREEN}  ${var2}: ${NC})" -r v2
+        declare -g "CENSYS_ID=$v1"
+        declare -g "CENSYS_SECRET=$v2"
+        echo -e "${GREEN}  ✓ Tersimpan${NC}"
+    else
+        echo -e "${YELLOW}  ⊘ Skipped${NC}"
+    fi
+}
+
+echo ""
+echo -e "${CYAN}═══════════════════════════════════════════════${NC}"
+echo -e "${CYAN}  TIER 1 - WAJIB (Paling Berdampak)${NC}"
+echo -e "${CYAN}═══════════════════════════════════════════════${NC}"
+
+input_api "Chaos (ProjectDiscovery)" \
+    "https://chaos.projectdiscovery.io/" \
+    "UNLIMITED free - paling recommended!" \
+    "CHAOS_KEY"
+
+input_api "GitHub Personal Access Token" \
+    "https://github.com/settings/tokens" \
+    "Scope: public_repo (centang saja itu)" \
+    "GITHUB_KEY"
+
+input_api "VirusTotal" \
+    "https://www.virustotal.com/gui/my-apikey" \
+    "500 req/day - lumayan powerful" \
+    "VT_KEY"
+
+input_api "Shodan" \
+    "https://account.shodan.io/" \
+    "100 query credits free" \
+    "SHODAN_KEY"
+
+input_api "SecurityTrails" \
+    "https://securitytrails.com/app/account/credentials" \
+    "50 query/bulan free" \
+    "ST_KEY"
+
+input_api "URLScan.io" \
+    "https://urlscan.io/user/profile/" \
+    "1000/day free" \
+    "URLSCAN_KEY"
+
+echo ""
+echo -e "${CYAN}═══════════════════════════════════════════════${NC}"
+echo -e "${CYAN}  TIER 2 - OPTIONAL (Tambahan)${NC}"
+echo -e "${CYAN}═══════════════════════════════════════════════${NC}"
+
+input_api_double "Censys" \
+    "https://search.censys.io/account/api" \
+    "App ID" \
+    "Secret"
+
+input_api "BinaryEdge" \
+    "https://app.binaryedge.io/account/api" \
+    "250/bulan free" \
+    "BE_KEY"
+
+input_api "FullHunt" \
+    "https://fullhunt.io/user/settings" \
+    "100/bulan free" \
+    "FH_KEY"
+
+input_api "LeakIX" \
+    "https://leakix.net/" \
+    "Misconfig & leak detection" \
+    "LEAKIX_KEY"
+
+input_api "Netlas" \
+    "https://app.netlas.io/profile/" \
+    "50/day free" \
+    "NETLAS_KEY"
+
+input_api "BeVigil" \
+    "https://bevigil.com/" \
+    "Mobile app intel - optional" \
+    "BEVIGIL_KEY"
+
+# ============================================
+# WRITE CONFIG FILES
+# ============================================
+echo ""
+echo -e "${YELLOW}[+] Menulis konfigurasi...${NC}"
+
+# File 1: subfinder config (YAML format)
+cat > "$CONFIG_FILE" << EOF
+# Subfinder Provider Config
+# Generated by Bug Hunter Recon Setup Wizard
+# $(date)
+
+EOF
+
+[ -n "$CHAOS_KEY" ] && echo -e "chaos:\n  - $CHAOS_KEY\n" >> "$CONFIG_FILE"
+[ -n "$GITHUB_KEY" ] && echo -e "github:\n  - $GITHUB_KEY\n" >> "$CONFIG_FILE"
+[ -n "$VT_KEY" ] && echo -e "virustotal:\n  - $VT_KEY\n" >> "$CONFIG_FILE"
+[ -n "$SHODAN_KEY" ] && echo -e "shodan:\n  - $SHODAN_KEY\n" >> "$CONFIG_FILE"
+[ -n "$ST_KEY" ] && echo -e "securitytrails:\n  - $ST_KEY\n" >> "$CONFIG_FILE"
+[ -n "$URLSCAN_KEY" ] && echo -e "urlscan:\n  - $URLSCAN_KEY\n" >> "$CONFIG_FILE"
+[ -n "$CENSYS_ID" ] && echo -e "censys:\n  - $CENSYS_ID:$CENSYS_SECRET\n" >> "$CONFIG_FILE"
+[ -n "$BE_KEY" ] && echo -e "binaryedge:\n  - $BE_KEY\n" >> "$CONFIG_FILE"
+[ -n "$FH_KEY" ] && echo -e "fullhunt:\n  - $FH_KEY\n" >> "$CONFIG_FILE"
+[ -n "$LEAKIX_KEY" ] && echo -e "leakix:\n  - $LEAKIX_KEY\n" >> "$CONFIG_FILE"
+[ -n "$NETLAS_KEY" ] && echo -e "netlas:\n  - $NETLAS_KEY\n" >> "$CONFIG_FILE"
+[ -n "$BEVIGIL_KEY" ] && echo -e "bevigil:\n  - $BEVIGIL_KEY\n" >> "$CONFIG_FILE"
+
+chmod 600 "$CONFIG_FILE"
+
+# File 2: ENV file untuk tools lain (gau, github-subdomains, dll)
+cat > "$RECON_ENV" << EOF
+# Bug Hunter Recon - Environment Variables
+# AUTO-GENERATED - Jangan commit ke git!
+
+export CHAOS_KEY="${CHAOS_KEY}"
+export GITHUB_TOKEN="${GITHUB_KEY}"
+export VT_API_KEY="${VT_KEY}"
+export SHODAN_API_KEY="${SHODAN_KEY}"
+export SECURITYTRAILS_KEY="${ST_KEY}"
+export URLSCAN_KEY="${URLSCAN_KEY}"
+export CENSYS_API_ID="${CENSYS_ID}"
+export CENSYS_API_SECRET="${CENSYS_SECRET}"
+export BINARYEDGE_KEY="${BE_KEY}"
+export FULLHUNT_KEY="${FH_KEY}"
+export LEAKIX_KEY="${LEAKIX_KEY}"
+export NETLAS_KEY="${NETLAS_KEY}"
+EOF
+
+chmod 600 "$RECON_ENV"
+
+# Auto-source di bashrc
+if ! grep -q "recon/.env" ~/.bashrc; then
+    echo "" >> ~/.bashrc
+    echo "# Bug Hunter Recon API Keys" >> ~/.bashrc
+    echo "[ -f ~/.config/recon/.env ] && source ~/.config/recon/.env" >> ~/.bashrc
+fi
+
+# ============================================
+# SUMMARY
+# ============================================
+echo ""
+echo -e "${GREEN}╔══════════════════════════════════════════╗${NC}"
+echo -e "${GREEN}║         ✓ SETUP COMPLETE!                ║${NC}"
+echo -e "${GREEN}╚══════════════════════════════════════════╝${NC}"
+echo ""
+echo -e "${CYAN}📁 Config tersimpan di:${NC}"
+echo -e "   ${YELLOW}• ~/.config/subfinder/provider-config.yaml${NC}"
+echo -e "   ${YELLOW}• ~/.config/recon/.env${NC}"
+echo ""
+echo -e "${CYAN}🔒 Permission: 600 (hanya kamu yang bisa baca)${NC}"
+echo ""
+
+# Hitung berapa API yang terisi
+count=0
+[ -n "$CHAOS_KEY" ] && ((count++))
+[ -n "$GITHUB_KEY" ] && ((count++))
+[ -n "$VT_KEY" ] && ((count++))
+[ -n "$SHODAN_KEY" ] && ((count++))
+[ -n "$ST_KEY" ] && ((count++))
+[ -n "$URLSCAN_KEY" ] && ((count++))
+[ -n "$CENSYS_ID" ] && ((count++))
+[ -n "$BE_KEY" ] && ((count++))
+[ -n "$FH_KEY" ] && ((count++))
+[ -n "$LEAKIX_KEY" ] && ((count++))
+[ -n "$NETLAS_KEY" ] && ((count++))
+
+echo -e "${GREEN}✓ Total
+echo -e "${GREEN}✓ Total API terdaftar: ${count}${NC}"
+echo ""
+echo -e "${YELLOW}[!] Jalankan:${NC} ${CYAN}source ~/.bashrc${NC}"
+echo -e "${YELLOW}[!] Lalu:${NC} ${CYAN}./recon.sh <domain> ${NC}"
+echo ""
