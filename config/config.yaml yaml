@@ -1,0 +1,46 @@
+# ============================================
+# Bug Hunter Recon - Main Config
+# ============================================
+
+# Mode
+mode:
+  default: "deep"  # quick | deep
+
+# Threads & Rate Limit (aman, tidak DoS target)
+performance:
+  httpx_threads: 50
+  httpx_rate: 100
+  nuclei_threads: 25
+  nuclei_rate: 150
+  naabu_rate: 1000
+  puredns_rate: 2000
+  katana_concurrency: 10
+
+# Timeouts
+timeout:
+  http: 10
+  dns: 5
+  katana: 15
+
+# Nuclei Settings
+nuclei:
+  severity: "low,medium,high,critical"
+  exclude_tags: "dos,fuzz,intrusive"
+  include_tags: "cve,exposure,misconfig,takeover,default-login,auth-bypass"
+
+# Paths (auto-detect)
+paths:
+  wordlists: "~/wordlists"
+  seclists: "~/wordlists/SecLists"
+  resolvers: "~/wordlists/resolvers.txt"
+  trusted_resolvers: "~/wordlists/resolvers-trusted.txt"
+  dns_wordlist: "~/wordlists/best-dns-wordlist.txt"
+  tools: "~/tools"
+
+# Scope filter (untuk HackerOne)
+scope:
+  strict_mode: true
+  exclude_patterns:
+    - "*.atlassian.net"
+    - "*.salesforce.com"
+    - "*.zendesk.com"
