@@ -1,7 +1,7 @@
 #!/bin/bash
 # ============================================
 # Progress Helper - Loading, Bar, ETA, Stats
-# Version: 2.3 (fixed + enhanced)
+# Version: 2.4 (CDN-aware + tech-routing)
 # ============================================
 
 # Colors
@@ -18,6 +18,13 @@ PHASE_START_TIME=0
 STEP_START_TIME=0
 LOG_FILE=${LOG_FILE:-""}
 DISCORD_WEBHOOK=${DISCORD_WEBHOOK:-""}
+
+# CDN awareness flag (diset dari recon.sh setelah Phase 2)
+CDN_DETECTED=${CDN_DETECTED:-0}
+CDN_NAMES=${CDN_NAMES:-""}
+
+# Tech stack tracking (diset dari recon.sh setelah Phase 2)
+TECH_STACK=${TECH_STACK:-""}
 
 # ═══════════════════════════════════════════
 # LOG TO FILE (opsional)
@@ -77,7 +84,7 @@ format_duration() {
 # ═══════════════════════════════════════════
 draw_bar() {
     local cur=${1:-0} total=${2:-1} width=${3:-30}
-    [ "$total" -eq 0 ] && total=1   # hindari division by zero
+    [ "$total" -eq 0 ] && total=1
     local percent=$((cur * 100 / total))
     local filled=$((cur * width / total))
     local empty=$((width - filled))
@@ -85,6 +92,69 @@ draw_bar() {
     for ((i=0; i<filled; i++)); do bar+="█"; done
     for ((i=0; i<empty; i++)); do bar+="░"; done
     echo "${bar} ${percent}%"
+}
+
+# ═══════════════════════════════════════════
+# CDN WARNING BANNER
+# Tampilkan peringatan kalau CDN terdeteksi
+# ═══════════════════════════════════════════
+show_cdn_warning() {
+    local phase_name=${1:-""}
+    [ "$CDN_DETECTED" -eq 0 ] && return 0
+
+    echo ""
+    echo -e "${YELLOW}  ┌─────────────────────────────────────────────────────┐${NC}"
+    echo -e "${YELLOW}  │ ⚠  CDN DETECTED: ${WHITE}${CDN_NAMES}${YELLOW}${NC}"
+    if [ -n "$phase_name" ]; then
+        echo -e "${YELLOW}  │ Phase ini mungkin hit CDN bukan origin server.     │${NC}"
+        echo -e "${YELLOW}  │ Hasil ${phase_name} bisa kurang akurat.           │${NC}"
+    fi
+    echo -e "${YELLOW}  │ Tip: cari origin IP via Shodan/Censys/Fofa          │${NC}"
+    echo -e "${YELLOW}  └─────────────────────────────────────────────────────┘${NC}"
+    echo ""
+}
+
+# ═══════════════════════════════════════════
+# TECH-AWARE NUCLEI HINT
+# Tampilkan template yang direkomendasikan
+# berdasarkan tech stack yang terdeteksi
+# ═══════════════════════════════════════════
+show_tech_hint() {
+    [ -z "$TECH_STACK" ] && return 0
+
+    local hints=()
+
+    echo "$TECH_STACK" | grep -qi "wordpress\|wp-content\|wp-login" && \
+        hints+=("WordPress → prioritaskan nuclei wp-plugins, wp-themes")
+    echo "$TECH_STACK" | grep -qi "laravel\|L5\b" && \
+        hints+=("Laravel → cek CVE debug-mode, .env exposed, RCE laravel")
+    echo "$TECH_STACK" | grep -qi "drupal" && \
+        hints+=("Drupal → drupalgeddon2 (CVE-2018-7600), nuclei drupal templates")
+    echo "$TECH_STACK" | grep -qi "joomla" && \
+        hints+=("Joomla → nuclei joomla templates, /administrator/ bypass")
+    echo "$TECH_STACK" | grep -qi "spring\|java\|tomcat" && \
+        hints+=("Java/Spring → Spring4Shell, Actuator endpoints, Log4Shell")
+    echo "$TECH_STACK" | grep -qi "php" && \
+        hints+=("PHP → cek phpinfo.php, PHP-FPM misconfig, file upload")
+    echo "$TECH_STACK" | grep -qi "nginx" && \
+        hints+=("Nginx → path traversal alias, off-by-slash, open proxy")
+    echo "$TECH_STACK" | grep -qi "apache" && \
+        hints+=("Apache → mod_status, CVE-2021-41773 (path traversal)")
+    echo "$TECH_STACK" | grep -qi "next\.js\|nuxt\|react\|vue" && \
+        hints+=("SPA Framework → client-side routing, API endpoint leakage via JS")
+    echo "$TECH_STACK" | grep -qi "graphql" && \
+        hints+=("GraphQL → introspection query, batching attacks")
+    echo "$TECH_STACK" | grep -qi "jenkins\|gitlab\|jira\|confluence" && \
+        hints+=("DevOps tool → default creds, SSRF, CVE templates tersedia")
+
+    if [ ${#hints[@]} -gt 0 ]; then
+        echo ""
+        echo -e "  ${CYAN}🔍 Tech-aware hints (dari Phase 2):${NC}"
+        for hint in "${hints[@]}"; do
+            echo -e "  ${GREEN}→${NC} $hint"
+        done
+        echo ""
+    fi
 }
 
 # ═══════════════════════════════════════════
@@ -179,7 +249,7 @@ step_info() {
 # ═══════════════════════════════════════════
 check_tool() {
     local tool=$1
-    local required=${2:-"false"}   # "true" = wajib ada, exit kalau tidak
+    local required=${2:-"false"}
     if command -v "$tool" &>/dev/null; then
         echo -e "  ${GREEN}✓${NC} $tool ${DIM}($(command -v "$tool"))${NC}"
         return 0
@@ -200,14 +270,12 @@ check_all_tools() {
 
     local failed=0
 
-    # Required tools
     for t in subfinder httpx dnsx nuclei jq curl; do
         check_tool "$t" "true" || ((failed++)) || true
     done
 
     echo -e "${DIM}  ──────────────────────────────────────────${NC}"
 
-    # Optional tools
     for t in amass assetfinder katana gau waybackurls waymore ffuf dalfox naabu trufflehog notify uro anew; do
         check_tool "$t" "false" || true
     done
@@ -215,29 +283,27 @@ check_all_tools() {
     echo -e "${DIM}  ──────────────────────────────────────────${NC}"
 
     if [ "$failed" -gt 0 ]; then
-        echo -e "  ${RED}✗ $failed required tool tidak ditemukan. Install dulu!${NC}"
+        echo -e "  ${RED}✗ $failed required tool(s) missing. Install dulu.${NC}"
         return 1
-    else
-        echo -e "  ${GREEN}✓ Semua required tool siap!${NC}"
-        return 0
     fi
+    return 0
 }
 
 # ═══════════════════════════════════════════
-# LIVE PROGRESS (untuk task panjang)
+# LIVE COUNTER (watch file growth)
 # ═══════════════════════════════════════════
-live_progress() {
-    local file=${1:-/dev/null} label=${2:-"Processing"} max_time=${3:-300}
+watch_file_count() {
+    local file=${1:-"/dev/null"}
+    local label=${2:-"Processing"}
+    local max_time=${3:-7200}
     local start=$(date +%s)
     local chars="⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
     local i=0
-    local bg_pid=${4:-""}   # PID background process yang ditunggu (opsional)
+    local bg_pid=${4:-""}
 
-    # Gunakan PID yang diberikan, atau $! kalau tidak ada
     local watch_pid="${bg_pid:-${!:-""}}"
 
     while true; do
-        # Cek apakah process masih jalan
         if [ -n "$watch_pid" ] && ! kill -0 "$watch_pid" 2>/dev/null; then
             break
         fi
@@ -264,21 +330,21 @@ show_stats_inline() {
     live=$([ -f live/live_urls.txt ] && wc -l < live/live_urls.txt || echo "0")
     urls=$([ -f urls/all_urls_dedup.txt ] && wc -l < urls/all_urls_dedup.txt || echo "0")
     js=$([ -f js/js_live.txt ] && wc -l < js/js_live.txt || echo "0")
-    # Aggregate semua hasil nuclei (bukan nuclei/results.txt yang tidak ada)
     vulns=$(grep -ch "\[critical\]\|\[high\]\|\[medium\]\|\[low\]\|\[info\]" nuclei/*.txt 2>/dev/null | awk '{s+=$1}END{print s+0}')
 
     echo -e "${DIM}  ─────────────────────────────────────────${NC}"
     echo -e "  ${BOLD}📊 Stats:${NC} Subs:${WHITE}$subs${NC} | Live:${WHITE}$live${NC} | URLs:${WHITE}$urls${NC} | JS:${WHITE}$js${NC} | Vulns:${WHITE}$vulns${NC}"
+    # Tampilkan CDN flag kalau terdeteksi
+    [ "$CDN_DETECTED" -eq 1 ] && echo -e "  ${YELLOW}⚠ CDN: ${CDN_NAMES} terdeteksi — port scan & brute mungkin tidak akurat${NC}"
     echo -e "${DIM}  ─────────────────────────────────────────${NC}"
 }
 
 # ═══════════════════════════════════════════
 # DISCORD NOTIFY (opsional)
-# Set DISCORD_WEBHOOK di env untuk aktifkan
 # ═══════════════════════════════════════════
 show_notify() {
     local title=${1:-"Recon Update"} msg=${2:-""} color=${3:-"3066993"}
-    [ -z "$DISCORD_WEBHOOK" ] && return 0   # skip kalau webhook tidak diset
+    [ -z "$DISCORD_WEBHOOK" ] && return 0
 
     local payload
     payload=$(jq -n \
@@ -294,26 +360,29 @@ show_notify() {
     _log "Discord notify sent: $title - $msg"
 }
 
-# Shortcut untuk notify critical finding
 notify_critical() {
     local target=${1:-"?"} finding=${2:-"?"}
     show_notify "🚨 CRITICAL FINDING!" \
         "**Target:** $target\n**Finding:** $finding\n**Time:** $(date '+%H:%M:%S')" \
-        "15158332"   # warna merah
+        "15158332"
 }
 
-# Notify phase selesai
 notify_phase_done() {
     local phase=${1:-"?"} name=${2:-"?"} dur=${3:-"?"}
     show_notify "✅ Phase $phase Done" \
         "**Phase:** $name\n**Duration:** $dur\n**ETA:** $(show_eta)" \
-        "3066993"    # warna hijau
+        "3066993"
+}
+
+notify_cdn_detected() {
+    local target=${1:-"?"} cdns=${2:-"CDN"}
+    show_notify "⚠️ CDN Detected" \
+        "**Target:** $target\n**CDN:** $cdns\n**Impact:** Port scan & brute mungkin tidak efektif. Cari origin IP!" \
+        "16776960"
 }
 
 # ═══════════════════════════════════════════
-# TIPS ROTATOR (Edukasi sambil nunggu)
-# FIX: semua $ dalam string di-escape supaya tidak
-# dievaluasi bash saat sourced dengan set -u
+# TIPS ROTATOR
 # ═══════════════════════════════════════════
 TIPS=(
     "💡 Jangan lupa cek scope di HackerOne sebelum hunt!"
@@ -341,6 +410,11 @@ TIPS=(
     "💡 dnsx -resp untuk lihat DNS record lengkap, bukan cuma resolve"
     "💡 naabu -top-ports 1000 lebih safe dari full scan untuk bug bounty"
     "💡 Trufflehog v3: scan JS file untuk secret leak otomatis"
+    "💡 Target pakai Cloudflare? Cari origin IP di Shodan: ssl.cert.subject.cn:target.com"
+    "💡 Tech stack detected? Nuclei punya template spesifik per framework!"
+    "💡 Passive enum dulu (crt.sh, subfinder) sebelum active DNS bruteforce"
+    "💡 httpx -cdn flag bisa detect apakah host di balik CDN"
+    "💡 GraphQL endpoint? Coba introspection query untuk dump semua schema"
 )
 
 show_random_tip() {
@@ -378,7 +452,7 @@ show_banner() {
   / __  / / / / __ `/ /_/ / / / / __ \/ __/ _ \/ ___/
  / /_/ / /_/ / /_/ / __  / /_/ / / / / /_/  __/ /    
 /_____/\__,_/\__, /_/ /_/\__,_/_/ /_/\__/\___/_/     
-            /____/       RECON v2.3                   
+            /____/       RECON v2.4                   
 EOF
     echo -e "${NC}"
     echo -e "${MAGENTA}╔══════════════════════════════════════════════════════════╗${NC}"
@@ -425,23 +499,22 @@ show_final_summary() {
     printf "  %-18s ${WHITE}%s${NC}\n" "Vulnerabilities:" "$vulns"
     printf "  %-18s ${RED}%s${NC}\n"   "  Critical:"   "$critical"
     printf "  %-18s ${YELLOW}%s${NC}\n" "  High:"      "$high"
+    [ "$CDN_DETECTED" -eq 1 ] && printf "  %-18s ${YELLOW}%s${NC}\n" "CDN Detected:" "$CDN_NAMES"
     echo ""
 
     _log "=== RECON DONE: duration=$(format_duration $total_time) subs=$subs live=$live vulns=$vulns critical=$critical ==="
 
-    # Discord notify saat selesai
     show_notify "🏁 Recon Complete!" \
         "**Duration:** $(format_duration $total_time)\n**Subs:** $subs | **Live:** $live\n**Vulns:** $vulns (**Critical:** $critical, **High:** $high)" \
         "3447003"
 }
 
 # ═══════════════════════════════════════════
-# CLEANUP (dipanggil trap dari recon.sh)
+# CLEANUP
 # ═══════════════════════════════════════════
 progress_cleanup() {
     stop_spinner
     _log "=== RECON INTERRUPTED ==="
 }
 
-# Trap default (override di recon.sh kalau perlu)
 trap 'progress_cleanup; echo ""; exit 130' INT TERM
