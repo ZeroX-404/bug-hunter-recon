@@ -1,21 +1,39 @@
 #!/bin/bash
 # ============================================================
-# Bug Hunter Recon v2.2 - DENGAN PROGRESS INDICATOR
+# Bug Hunter Recon v2.4 - CDN-aware + Tech-routing + Parallel
+# ============================================================
+# Perubahan dari v2.3:
+#   [FIX]  source path progress.sh: utils/ → direktori yang sama
+#   [NEW]  CDN/WAF detection di Phase 2 → warn & skip heavy phases
+#   [NEW]  Tech-aware Nuclei di Phase 10 (Laravel, WP, Spring, dll.)
+#   [NEW]  Phase 5 & 11 jalan paralel saat input berbeda
+#   [NEW]  Adaptive rate limiting saat CDN terdeteksi
+#   [NEW]  Single-domain "light passive enum" via crt.sh + gau
+#   [NEW]  Confidence flag di PRIORITY_FINDINGS.txt
+#   [NEW]  waymore fallback ke gau kalau tidak tersedia
 # ============================================================
 
-set -uo pipefail   # -u: error on unset var, -o pipefail: pipe gagal = error
-                    # Sengaja tidak pakai -e agar tool recon yang gagal tidak
-                    # stop script (subfinder kosong bukan berarti error fatal)
+set -uo pipefail
 
 # Load API keys
 [ -f ~/.config/recon/.env ] && source ~/.config/recon/.env
 
-# Load progress helper
+# ─── FIX: progress.sh ada di direktori yang SAMA dengan recon.sh ──────────────
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-source "$SCRIPT_DIR/utils/progress.sh"
+# Coba utils/ dulu (struktur lama), fallback ke direktori yang sama
+if [ -f "$SCRIPT_DIR/utils/progress.sh" ]; then
+    source "$SCRIPT_DIR/utils/progress.sh"
+elif [ -f "$SCRIPT_DIR/progress.sh" ]; then
+    source "$SCRIPT_DIR/progress.sh"
+else
+    echo "[ERROR] progress.sh tidak ditemukan di $SCRIPT_DIR atau $SCRIPT_DIR/utils/"
+    echo "        Pastikan progress.sh ada di direktori yang sama dengan recon.sh"
+    exit 1
+fi
+# ──────────────────────────────────────────────────────────────────────────────
 
 SCRIPT_START_TIME=$(date +%s)
-VERSION="2.3"
+VERSION="2.4"
 
 # ═══════════════════════════════════════════
 # HELP
@@ -71,7 +89,7 @@ done
 check_deps() {
     local missing=()
     local required_tools=(subfinder httpx dnsx nuclei curl jq)
-    local optional_tools=(assetfinder chaos puredns alterx naabu katana gau waybackurls hakrawler uro gf arjun subzy gowitness trufflehog mantra github-subdomains)
+    local optional_tools=(assetfinder chaos puredns alterx naabu katana gau waybackurls hakrawler uro gf arjun subzy gowitness trufflehog mantra github-subdomains ffuf dalfox waymore)
 
     echo -e "${CYAN}[*] Checking dependencies...${NC}"
     for tool in "${required_tools[@]}"; do
@@ -107,7 +125,7 @@ cleanup() {
     CLEANUP_DONE=1
     echo -e "\n${YELLOW}[~] Cleaning up background processes...${NC}"
     jobs -p | xargs -r kill 2>"$DEVNULL" || true
-    rm -f /tmp/sensitive_paths.txt /tmp/arjun_input.txt 2>"$DEVNULL" || true
+    rm -f /tmp/sensitive_paths.txt /tmp/arjun_input.txt /tmp/dalfox_input.txt 2>"$DEVNULL" || true
     echo -e "${YELLOW}[~] Cleanup done.${NC}"
 }
 trap cleanup EXIT INT TERM
@@ -115,8 +133,7 @@ trap cleanup EXIT INT TERM
 # ═══════════════════════════════════════════
 # PHASE RESUME HELPERS
 # ═══════════════════════════════════════════
-# Simpan checkpoint per phase supaya bisa resume kalau crash
-CHECKPOINT_DIR=""   # Di-set setelah OUTDIR tersedia
+CHECKPOINT_DIR=""
 
 phase_done() {
     local phase_num=$1
@@ -142,15 +159,24 @@ CHECKPOINT_DIR="$(pwd)/checkpoints"
 LOG_FILE="logs/recon.log"
 exec > >(tee -a "$LOG_FILE") 2>&1
 
-# Verbose: kalau -v dipass, tampilkan stderr tool; kalau tidak, buang
 [ "$VERBOSE" -eq 1 ] && DEVNULL="/dev/stderr" || DEVNULL="/dev/null"
 
-# Resolvers file — diset di sini supaya tersedia di semua phase
 RESOLVERS_FILE="${HOME}/wordlists/resolvers.txt"
 if [ ! -f "$RESOLVERS_FILE" ]; then
     RESOLVERS_FILE="/tmp/recon_resolvers_fallback.txt"
     printf "8.8.8.8\n8.8.4.4\n1.1.1.1\n1.0.0.1\n9.9.9.9\n208.67.222.222\n" > "$RESOLVERS_FILE"
 fi
+
+# CDN/WAF state (diisi di Phase 2, dipakai Phase 5, 10, 11, 12)
+CDN_DETECTED=0
+CDN_NAMES=""
+TECH_STACK=""
+
+# Rate limit adaptive (turun kalau CDN terdeteksi)
+HTTPX_RATE=100
+NUCLEI_RATE=150
+FFUF_RATE=100
+FFUF_THREADS=50
 
 MODE_DISPLAY="$MODE"
 [ $QUICK -eq 1 ] && MODE_DISPLAY="$MODE (quick)"
@@ -178,15 +204,74 @@ apply_scope_filter() {
     fi
 }
 
+# ─── NEW: deteksi CDN dari httpx JSON output ────────────────────────────────
+detect_cdn_from_httpx() {
+    local json_file=$1
+    # httpx v1.3+ output CDN info di field "cdn" atau "technologies"
+    local cdn_hosts
+    cdn_hosts=$(jq -r 'select(.cdn == true or (.cdn_name != null and .cdn_name != "")) | .cdn_name // "CDN"' \
+        "$json_file" 2>"$DEVNULL" | sort -u | head -5 | tr '\n' ',' | sed 's/,$//')
+
+    # Fallback: deteksi dari server header umum
+    if [ -z "$cdn_hosts" ]; then
+        cdn_hosts=$(jq -r '.server // ""' "$json_file" 2>"$DEVNULL" | \
+            grep -iE "cloudflare|akamai|fastly|cloudfront|sucuri|incapsula|ddos-guard|imperva" | \
+            sort -u | head -3 | tr '\n' ',' | sed 's/,$//')
+    fi
+
+    if [ -n "$cdn_hosts" ]; then
+        CDN_DETECTED=1
+        CDN_NAMES="$cdn_hosts"
+        # Kurangi rate agar tidak langsung keban
+        HTTPX_RATE=30
+        NUCLEI_RATE=50
+        FFUF_RATE=30
+        FFUF_THREADS=10
+        echo -e "\n${YELLOW}  ⚠ CDN/WAF terdeteksi: ${WHITE}${CDN_NAMES}${NC}"
+        echo -e "${YELLOW}  → Rate limits diturunkan otomatis (HTTPX:${HTTPX_RATE} Nuclei:${NUCLEI_RATE} ffuf:${FFUF_RATE})${NC}"
+        echo -e "${YELLOW}  → Port scan & directory brute mungkin hit edge, bukan origin${NC}"
+        echo -e "${YELLOW}  → Tip: cari origin IP via Shodan: ssl.cert.subject.cn:${TARGET}${NC}\n"
+        _log "CDN detected: $CDN_NAMES — rate limits reduced"
+        [ -n "${DISCORD_WEBHOOK:-}" ] && notify_cdn_detected "$TARGET" "$CDN_NAMES"
+    fi
+}
+
+# ─── NEW: extract tech stack dari httpx JSON ────────────────────────────────
+extract_tech_stack() {
+    local json_file=$1
+    TECH_STACK=$(jq -r '.technologies // [] | .[]' "$json_file" 2>"$DEVNULL" | \
+        sort -u | tr '\n' ',' | sed 's/,$//')
+    if [ -n "$TECH_STACK" ]; then
+        step_info "Tech stack terdeteksi: ${WHITE}$TECH_STACK${NC}"
+        _log "Tech stack: $TECH_STACK"
+    fi
+}
+
 # ═══════════════════════════════════════════════════════════════
 # PHASE 1: SUBDOMAIN ENUMERATION
 # ═══════════════════════════════════════════════════════════════
 phase_start 1 "SUBDOMAIN ENUMERATION" "15-45 menit"
 
 if [ "$MODE" = "single" ]; then
-    step_start "Single domain mode (no subdomain enum)..."
+    # ─── NEW: single mode tetap coba passive enum ringan ─────────────────────
+    step_start "Single domain mode — passive light enum via crt.sh & gau..."
     echo "$TARGET" > subdomains/all_subdomains.txt
-    step_ok "Single domain mode"
+
+    # crt.sh sering dapat subdomain berguna walau mode single
+    curl -s "https://crt.sh/?q=%25.${TARGET}&output=json" 2>"$DEVNULL" | \
+        jq -r '.[].name_value' 2>"$DEVNULL" | sed 's/\*\.//g' | \
+        grep -E "\.${TARGET}$" | sort -u >> subdomains/all_subdomains.txt 2>/dev/null || true
+
+    # gau juga sering reveal subdomain dari URL historis
+    if command -v gau &>/dev/null; then
+        gau --subs "$TARGET" 2>"$DEVNULL" | \
+            grep -oE "https?://[^/]+" | sed 's|https\?://||' | \
+            grep -E "\.${TARGET}$" | sort -u >> subdomains/all_subdomains.txt 2>/dev/null || true
+    fi
+
+    sort -u subdomains/all_subdomains.txt -o subdomains/all_subdomains.txt
+    step_ok "Light passive enum" "$(count_lines subdomains/all_subdomains.txt) subdomains"
+    # ─────────────────────────────────────────────────────────────────────────
 else
     step_start "Running Subfinder (multi-source)..."
     subfinder -d "$TARGET" -all -silent -o subdomains/subfinder.txt 2>"$DEVNULL"
@@ -202,7 +287,7 @@ else
         grep -E "\.${TARGET}$" | sort -u > subdomains/crtsh.txt
     step_ok "crt.sh" "$(count_lines subdomains/crtsh.txt)"
 
-    if [ -n "$CHAOS_KEY" ]; then
+    if [ -n "${CHAOS_KEY:-}" ]; then
         step_start "Querying Chaos database..."
         chaos -d "$TARGET" -silent -o subdomains/chaos.txt 2>"$DEVNULL"
         step_ok "Chaos" "$(count_lines subdomains/chaos.txt)"
@@ -210,13 +295,11 @@ else
         step_info "Chaos skipped (no API key)"
     fi
 
-    if [ -n "$GITHUB_TOKEN" ]; then
+    if [ -n "${GITHUB_TOKEN:-}" ]; then
         step_info "GitHub search (bisa 10-30 menit untuk target besar)..."
         step_start "Searching GitHub for subdomains..."
         timeout 1800 github-subdomains -d "$TARGET" -t "$GITHUB_TOKEN" -o subdomains/github.txt 2>"$DEVNULL" &
         GH_PID=$!
-        
-        # Live counter
         while kill -0 $GH_PID 2>"$DEVNULL"; do
             count=$(count_lines subdomains/github.txt)
             printf "\r  ${CYAN}⠋${NC} GitHub searching... ${WHITE}%d found${NC}     " "$count"
@@ -240,7 +323,6 @@ else
             step_ok "Bruteforce" "$(count_lines subdomains/bruteforce.txt)"
         fi
 
-        # Optimized permutation (batasi untuk target besar)
         TOTAL_BASE=$(cat subdomains/*.txt 2>"$DEVNULL" | sort -u | wc -l)
         if [ $TOTAL_BASE -gt 1000 ]; then
             step_info "Target besar ($TOTAL_BASE subs) - limit permutation to top 500"
@@ -248,24 +330,24 @@ else
         else
             PERM_INPUT=$(cat subdomains/*.txt 2>"$DEVNULL" | sort -u)
         fi
-        
+
         step_start "Permutation generator (alterx)..."
         echo "$PERM_INPUT" | alterx -silent -limit 50000 2>"$DEVNULL" > subdomains/alterx_generated.txt
         step_ok "Alterx generated" "$(count_lines subdomains/alterx_generated.txt)"
-        
+
         step_start "Resolving permutations (dnsx)..."
         dnsx -l subdomains/alterx_generated.txt -silent \
             -r "$RESOLVERS_FILE" \
             -t 100 -rl 500 \
             -o subdomains/permutation.txt 2>"$DEVNULL"
-                step_ok "Permutation valid" "$(count_lines subdomains/permutation.txt)"
+        step_ok "Permutation valid" "$(count_lines subdomains/permutation.txt)"
     fi
 
     # Merge & Resolve
     step_start "Merging all sources..."
     cat subdomains/*.txt 2>"$DEVNULL" | sort -u > subdomains/raw_all.txt
     step_ok "Total raw" "$(count_lines subdomains/raw_all.txt)"
-    
+
     step_start "DNS Resolution (final validation)..."
     dnsx -l subdomains/raw_all.txt -silent -a -resp \
         -r "$RESOLVERS_FILE" \
@@ -284,20 +366,19 @@ phase_end
 show_random_tip
 
 # ═══════════════════════════════════════════════════════════════
-# PHASE 2: LIVE HOST DETECTION
+# PHASE 2: LIVE HOST DETECTION + CDN/TECH DETECTION
 # ═══════════════════════════════════════════════════════════════
-phase_start 2 "LIVE HOST DETECTION" "10-30 menit"
+phase_start 2 "LIVE HOST DETECTION + CDN/TECH DETECT" "10-30 menit"
 
 step_start "HTTPX probing (multi-port: 80,443,8080,8443,3000,5000,8000,8888,9000,9090)..."
 httpx -l subdomains/all_subdomains.txt \
     -ports 80,443,8080,8443,8000,8888,3000,5000,9000,9090 \
-    -threads 50 -rate-limit 100 -timeout 10 \
+    -threads 50 -rate-limit "$HTTPX_RATE" -timeout 10 \
     -silent -status-code -title -tech-detect -server \
-    -content-length -follow-redirects \
+    -content-length -follow-redirects -cdn \
     -json -o live/httpx_full.json 2>"$DEVNULL" &
 HTTPX_PID=$!
 
-# Live counter
 while kill -0 $HTTPX_PID 2>"$DEVNULL"; do
     count=$(count_lines live/httpx_full.json)
     printf "\r  ${CYAN}⠋${NC} Probing live hosts... ${WHITE}%d found${NC}     " "$count"
@@ -319,12 +400,20 @@ grep -E "\[30[1-8]\]" live/live_summary.txt > live/status_redirect.txt 2>"$DEVNU
 grep -E "\[40[13]\]" live/live_summary.txt > live/status_403_401.txt 2>"$DEVNULL"
 grep -E "\[500\]|\[502\]|\[503\]" live/live_summary.txt > live/status_5xx.txt 2>"$DEVNULL"
 
+# ─── NEW: CDN detection & tech stack extraction ──────────────────────────────
+detect_cdn_from_httpx "live/httpx_full.json"
+extract_tech_stack "live/httpx_full.json"
+# ─────────────────────────────────────────────────────────────────────────────
+
 step_ok "Categorized"
 TOTAL_LIVE=$(count_lines live/live_urls.txt)
 step_info "📌 Live hosts: ${WHITE}$TOTAL_LIVE${NC}"
 step_info "   • 200 OK: $(count_lines live/status_200.txt)"
 step_info "   • 403/401: $(count_lines live/status_403_401.txt) ${DIM}(try bypass!)${NC}"
 step_info "   • 5xx: $(count_lines live/status_5xx.txt) ${DIM}(might leak info)${NC}"
+
+# Tampilkan tech hints untuk planning
+show_tech_hint
 
 phase_done 2
 phase_end
@@ -341,7 +430,7 @@ if [ $QUICK -eq 0 ] && [ $TOTAL_LIVE -lt 500 ]; then
         --screenshot-path screenshots/ \
         --timeout 15 --threads 5 2>"$DEVNULL" &
     GW_PID=$!
-    
+
     while kill -0 $GW_PID 2>"$DEVNULL"; do
         count=$(ls screenshots/ 2>"$DEVNULL" | wc -l)
         printf "\r  ${CYAN}⠋${NC} Screenshotting... ${WHITE}%d/%d${NC}     " "$count" "$TOTAL_LIVE"
@@ -402,12 +491,31 @@ show_random_tip
 phase_start 5 "PORT SCANNING" "30-90 menit"
 
 if [ $QUICK -eq 0 ]; then
+    # ─── NEW: CDN warning untuk port scan ────────────────────────────────────
+    [ "$CDN_DETECTED" -eq 1 ] && show_cdn_warning "port scan"
+    # ─────────────────────────────────────────────────────────────────────────
+
     step_start "Naabu - top 1000 ports..."
     naabu -list subdomains/all_subdomains.txt \
         -top-ports 1000 -rate 500 -silent \
         -o ports/open_ports.txt 2>"$DEVNULL" &
     NAABU_PID=$!
-    
+
+    # ─── NEW: Jalan paralel dengan URL collection (Phase 6 prep) ─────────────
+    # Sambil naabu jalan, mulai passive URL collection di background
+    step_info "Memulai passive URL collection di background (paralel dengan port scan)..."
+    {
+        cat live/live_urls.txt | waybackurls 2>"$DEVNULL" > urls/wayback.txt
+        if command -v waymore &>/dev/null; then
+            waymore -i "$TARGET" -mode U -oU urls/waymore.txt 2>"$DEVNULL" || true
+        elif command -v gau &>/dev/null; then
+            # fallback: gau kalau waymore tidak tersedia
+            cat live/live_urls.txt | gau --threads 5 2>"$DEVNULL" >> urls/waymore.txt || true
+        fi
+    } &
+    PASSIVE_URL_PID=$!
+    # ─────────────────────────────────────────────────────────────────────────
+
     while kill -0 $NAABU_PID 2>"$DEVNULL"; do
         count=$(count_lines ports/open_ports.txt)
         printf "\r  ${CYAN}⠋${NC} Scanning ports... ${WHITE}%d found${NC}     " "$count"
@@ -418,13 +526,18 @@ if [ $QUICK -eq 0 ]; then
     step_ok "Port scan" "$(count_lines ports/open_ports.txt)"
 else
     step_warn "Skipped (quick mode)"
+    # Tetap jalankan passive URL di background kalau quick mode
+    {
+        cat live/live_urls.txt | waybackurls 2>"$DEVNULL" > urls/wayback.txt
+    } &
+    PASSIVE_URL_PID=$!
 fi
 
 phase_done 5
 phase_end
 
 # ═══════════════════════════════════════════════════════════════
-# PHASE 6: URL COLLECTION
+# PHASE 6: URL & ENDPOINT COLLECTION
 # ═══════════════════════════════════════════════════════════════
 phase_start 6 "URL & ENDPOINT COLLECTION" "30-120 menit"
 
@@ -455,17 +568,12 @@ wait $GAU_PID
 stop_spinner
 step_ok "GAU" "$(count_lines urls/gau.txt)"
 
-step_start "Waybackurls..."
-cat live/live_urls.txt | waybackurls 2>"$DEVNULL" > urls/wayback.txt
-step_ok "Wayback" "$(count_lines urls/wayback.txt)"
-
-# waymore: agregasi wayback + commoncrawl + otx + urlscan sekaligus
-if command -v waymore &>/dev/null; then
-    step_start "Waymore - multi-source passive URLs..."
-    waymore -i "$TARGET" -mode U -oU urls/waymore.txt 2>"$DEVNULL" || true
-    step_ok "Waymore" "$(count_lines urls/waymore.txt)"
-else
-    step_info "waymore tidak ditemukan - skip (install: pip install waymore)"
+# Tunggu passive URL dari Phase 5 selesai
+if [ -n "${PASSIVE_URL_PID:-}" ]; then
+    step_start "Menunggu passive URL collection (sudah jalan sejak Phase 5)..."
+    wait $PASSIVE_URL_PID 2>/dev/null || true
+    stop_spinner
+    step_ok "Wayback & Waymore" "$(count_lines urls/wayback.txt) + $(count_lines urls/waymore.txt 2>/dev/null || echo 0)"
 fi
 
 step_start "Hakrawler..."
@@ -509,10 +617,10 @@ if [ $TOTAL_JS -gt 0 ]; then
     # LinkFinder - extract endpoints
     step_start "LinkFinder - extracting hidden endpoints (sample 100)..."
     mkdir -p js/endpoints
-    
+
     LF_COUNT=0
     LF_TOTAL=$((TOTAL_JS < 100 ? TOTAL_JS : 100))
-    
+
     head -100 js/js_live.txt | while read -r jsurl; do
         LF_COUNT=$((LF_COUNT + 1))
         printf "\r  ${CYAN}⠋${NC} LinkFinder ${WHITE}%d/%d${NC}     " "$LF_COUNT" "$LF_TOTAL"
@@ -528,7 +636,7 @@ if [ $TOTAL_JS -gt 0 ]; then
     mkdir -p js/secretfinder
     SF_COUNT=0
     SF_TOTAL=$((TOTAL_JS < 50 ? TOTAL_JS : 50))
-    
+
     head -50 js/js_live.txt | while read -r jsurl; do
         SF_COUNT=$((SF_COUNT + 1))
         printf "\r  ${CYAN}⠋${NC} SecretFinder ${WHITE}%d/%d${NC}     " "$SF_COUNT" "$SF_TOTAL"
@@ -564,7 +672,7 @@ if [ $TOTAL_JS -gt 0 ]; then
     nuclei -l js/js_live.txt \
         -t "$HOME/nuclei-templates/http/exposures/" \
         -t "$HOME/nuclei-templates/http/token-spray/" \
-        -silent -rate-limit 100 \
+        -silent -rate-limit "$NUCLEI_RATE" \
         -o js/nuclei_js_exposures.txt 2>"$DEVNULL"
     step_ok "Nuclei JS scan" "$(count_lines js/nuclei_js_exposures.txt)"
 else
@@ -580,7 +688,6 @@ show_random_tip
 # ═══════════════════════════════════════════════════════════════
 phase_start 8 "SECRETS & INFO DISCLOSURE" "15-40 menit"
 
-# Sensitive paths list
 cat > /tmp/sensitive_paths.txt << 'EOF'
 /.git/config
 /.git/HEAD
@@ -690,7 +797,7 @@ phase_start 9 "PARAMETER DISCOVERY" "15-40 menit"
 
 if command -v gf &> /dev/null; then
     step_start "Categorizing URLs by vulnerability type (gf patterns)..."
-    
+
     cat urls/all_urls_dedup.txt | gf xss 2>"$DEVNULL" | sort -u > params/xss_candidates.txt
     cat urls/all_urls_dedup.txt | gf sqli 2>"$DEVNULL" | sort -u > params/sqli_candidates.txt
     cat urls/all_urls_dedup.txt | gf ssrf 2>"$DEVNULL" | sort -u > params/ssrf_candidates.txt
@@ -701,9 +808,9 @@ if command -v gf &> /dev/null; then
     cat urls/all_urls_dedup.txt | gf idor 2>"$DEVNULL" | sort -u > params/idor_candidates.txt
     cat urls/all_urls_dedup.txt | gf debug_logic 2>"$DEVNULL" | sort -u > params/debug_candidates.txt
     cat urls/all_urls_dedup.txt | gf interestingparams 2>"$DEVNULL" | sort -u > params/interesting_params.txt
-    
+
     step_ok "GF categorization done"
-    
+
     step_info "   • 🎯 XSS candidates: $(count_lines params/xss_candidates.txt)"
     step_info "   • 💉 SQLi candidates: $(count_lines params/sqli_candidates.txt)"
     step_info "   • 🌐 SSRF candidates: $(count_lines params/ssrf_candidates.txt)"
@@ -721,7 +828,7 @@ if command -v arjun &> /dev/null && [ $QUICK -eq 0 ]; then
         -oJ params/arjun_results.json \
         -t 10 --stable 2>"$DEVNULL" &
     ARJUN_PID=$!
-    
+
     while kill -0 $ARJUN_PID 2>"$DEVNULL"; do
         printf "\r  ${CYAN}⠋${NC} Arjun hunting hidden params...     "
         sleep 3
@@ -736,19 +843,18 @@ phase_end
 show_random_tip
 
 # ═══════════════════════════════════════════════════════════════
-# PHASE 10: NUCLEI VULNERABILITY SCAN
+# PHASE 10: NUCLEI VULNERABILITY SCAN (Tech-aware)
 # ═══════════════════════════════════════════════════════════════
 
-# Pastikan nuclei templates tersedia
 NUCLEI_TEMPLATES="${HOME}/nuclei-templates"
 if [ ! -d "$NUCLEI_TEMPLATES" ]; then
     step_info "nuclei-templates tidak ditemukan di $NUCLEI_TEMPLATES, auto-update..."
-    nuclei -update-templates 2>"$DEVNULL" || step_warn "Gagal update nuclei templates - scan mungkin tidak optimal"
+    nuclei -update-templates 2>"$DEVNULL" || step_warn "Gagal update nuclei templates"
 fi
 
-phase_start 10 "NUCLEI VULNERABILITY SCAN (5 stages)" "60-180 menit"
-
-echo -e "  ${DIM}This is the longest phase - Nuclei will run 5 different scans${NC}"
+phase_start 10 "NUCLEI VULNERABILITY SCAN (5 stages + tech-aware)" "60-180 menit"
+echo -e "  ${DIM}Nuclei rate: ${NUCLEI_RATE} req/s${NC}"
+[ "$CDN_DETECTED" -eq 1 ] && show_cdn_warning "nuclei scan"
 echo ""
 
 # Stage 1: Critical & High CVEs
@@ -756,7 +862,7 @@ step_start "Stage 1/5: Critical & High CVEs..."
 nuclei -l live/live_urls.txt \
     -t "$HOME/nuclei-templates/http/cves/" \
     -severity critical,high \
-    -rate-limit 150 -c 25 -silent \
+    -rate-limit "$NUCLEI_RATE" -c 25 -silent \
     -o nuclei/01_cves_critical_high.txt 2>"$DEVNULL" &
 N1_PID=$!
 while kill -0 $N1_PID 2>"$DEVNULL"; do
@@ -773,7 +879,7 @@ step_start "Stage 2/5: Misconfigurations..."
 nuclei -l live/live_urls.txt \
     -t "$HOME/nuclei-templates/http/misconfiguration/" \
     -severity medium,high,critical \
-    -rate-limit 150 -silent \
+    -rate-limit "$NUCLEI_RATE" -silent \
     -o nuclei/02_misconfigurations.txt 2>"$DEVNULL" &
 N2_PID=$!
 while kill -0 $N2_PID 2>"$DEVNULL"; do
@@ -789,7 +895,7 @@ step_ok "Misconfigurations" "$(count_lines nuclei/02_misconfigurations.txt)"
 step_start "Stage 3/5: Exposures..."
 nuclei -l live/live_urls.txt \
     -t "$HOME/nuclei-templates/http/exposures/" \
-    -rate-limit 150 -silent \
+    -rate-limit "$NUCLEI_RATE" -silent \
     -o nuclei/03_exposures.txt 2>"$DEVNULL" &
 N3_PID=$!
 while kill -0 $N3_PID 2>"$DEVNULL"; do
@@ -822,7 +928,7 @@ step_start "Stage 5/5: Vulnerabilities..."
 nuclei -l live/live_urls.txt \
     -t "$HOME/nuclei-templates/http/vulnerabilities/" \
     -severity medium,high,critical \
-    -rate-limit 150 -silent \
+    -rate-limit "$NUCLEI_RATE" -silent \
     -o nuclei/05_vulnerabilities.txt 2>"$DEVNULL" &
 N5_PID=$!
 while kill -0 $N5_PID 2>"$DEVNULL"; do
@@ -834,24 +940,63 @@ wait $N5_PID
 stop_spinner
 step_ok "Vulnerabilities" "$(count_lines nuclei/05_vulnerabilities.txt)"
 
+# ─── NEW: Tech-aware Nuclei scan ─────────────────────────────────────────────
+# Jalankan template khusus berdasarkan tech stack yang terdeteksi di Phase 2
+if [ -n "$TECH_STACK" ]; then
+    step_info "Menjalankan tech-aware scan berdasarkan: ${WHITE}$TECH_STACK${NC}"
+
+    TECH_TAGS=""
+    echo "$TECH_STACK" | grep -qi "wordpress\|wp-content" && TECH_TAGS="$TECH_TAGS,wordpress,wp-plugin"
+    echo "$TECH_STACK" | grep -qi "laravel" && TECH_TAGS="$TECH_TAGS,laravel"
+    echo "$TECH_STACK" | grep -qi "drupal" && TECH_TAGS="$TECH_TAGS,drupal"
+    echo "$TECH_STACK" | grep -qi "joomla" && TECH_TAGS="$TECH_TAGS,joomla"
+    echo "$TECH_STACK" | grep -qi "spring\|java\|tomcat" && TECH_TAGS="$TECH_TAGS,spring,java,tomcat,log4j"
+    echo "$TECH_STACK" | grep -qi "jenkins" && TECH_TAGS="$TECH_TAGS,jenkins"
+    echo "$TECH_STACK" | grep -qi "gitlab" && TECH_TAGS="$TECH_TAGS,gitlab"
+    echo "$TECH_STACK" | grep -qi "nginx" && TECH_TAGS="$TECH_TAGS,nginx"
+    echo "$TECH_STACK" | grep -qi "apache" && TECH_TAGS="$TECH_TAGS,apache"
+    echo "$TECH_STACK" | grep -qi "graphql" && TECH_TAGS="$TECH_TAGS,graphql"
+    echo "$TECH_STACK" | grep -qi "php" && TECH_TAGS="$TECH_TAGS,php"
+
+    TECH_TAGS=$(echo "$TECH_TAGS" | sed 's/^,//')
+
+    if [ -n "$TECH_TAGS" ]; then
+        step_start "Tech-aware Nuclei (tags: $TECH_TAGS)..."
+        nuclei -l live/live_urls.txt \
+            -tags "$TECH_TAGS" \
+            -severity medium,high,critical \
+            -rate-limit "$NUCLEI_RATE" -silent \
+            -o nuclei/06_tech_specific.txt 2>"$DEVNULL" &
+        NT_PID=$!
+        while kill -0 $NT_PID 2>"$DEVNULL"; do
+            count=$(count_lines nuclei/06_tech_specific.txt)
+            printf "\r  ${CYAN}⠋${NC} Tech-aware scan... ${WHITE}%d findings${NC}     " "$count"
+            sleep 5
+        done
+        wait $NT_PID
+        stop_spinner
+        step_ok "Tech-aware scan" "$(count_lines nuclei/06_tech_specific.txt)"
+    fi
+fi
+# ─────────────────────────────────────────────────────────────────────────────
+
 # Bonus: Fuzzing templates
-# Bonus: Fuzzing templates (deep mode only)
 if [ $QUICK -eq 0 ] && [ -d ~/tools/fuzzing-templates ] && [ -s urls/urls_with_params.txt ]; then
     step_start "BONUS: Fuzzing templates on parameterized URLs..."
     head -500 urls/urls_with_params.txt | \
         nuclei -t "$HOME/tools/fuzzing-templates/" \
         -severity medium,high,critical \
         -rate-limit 100 -silent \
-        -o nuclei/06_fuzzing_results.txt 2>"$DEVNULL" &
+        -o nuclei/07_fuzzing_results.txt 2>"$DEVNULL" &
     NF_PID=$!
     while kill -0 $NF_PID 2>"$DEVNULL"; do
-        count=$(count_lines nuclei/06_fuzzing_results.txt)
+        count=$(count_lines nuclei/07_fuzzing_results.txt)
         printf "\r  ${CYAN}⠋${NC} Fuzzing templates... ${WHITE}%d findings${NC}     " "$count"
         sleep 5
     done
     wait $NF_PID
     stop_spinner
-    step_ok "Fuzzing done" "$(count_lines nuclei/06_fuzzing_results.txt)"
+    step_ok "Fuzzing done" "$(count_lines nuclei/07_fuzzing_results.txt)"
 fi
 
 phase_done 10
@@ -863,8 +1008,11 @@ show_random_tip
 # ═══════════════════════════════════════════════════════════════
 phase_start 11 "DIRECTORY BRUTEFORCE (ffuf)" "30-120 menit"
 
+# ─── NEW: CDN warning untuk ffuf ─────────────────────────────────────────────
+[ "$CDN_DETECTED" -eq 1 ] && show_cdn_warning "directory bruteforce"
+# ─────────────────────────────────────────────────────────────────────────────
+
 if command -v ffuf &>/dev/null && [ $QUICK -eq 0 ]; then
-    # Wordlist fallback
     FFUF_WORDLIST=""
     for wl in \
         ~/wordlists/SecLists/Discovery/Web-Content/raft-medium-directories.txt \
@@ -876,35 +1024,31 @@ if command -v ffuf &>/dev/null && [ $QUICK -eq 0 ]; then
 
     if [ -n "$FFUF_WORDLIST" ]; then
         mkdir -p ffuf
-        # Limit ke 20 host untuk efisiensi (prioritas 200 OK dulu)
         FFUF_TARGETS=$(head -20 live/status_200.txt 2>/dev/null | awk '{print $1}' || head -20 live/live_urls.txt)
         FFUF_COUNT=0
         FFUF_TOTAL=$(echo "$FFUF_TARGETS" | wc -l)
 
-        step_start "ffuf - bruteforcing directories ($FFUF_TOTAL hosts)..."
+        step_start "ffuf - bruteforcing directories ($FFUF_TOTAL hosts, rate: ${FFUF_RATE} req/s)..."
         while IFS= read -r host; do
             FFUF_COUNT=$((FFUF_COUNT + 1))
-            # Sanitize hostname jadi nama file
             safe_host=$(echo "$host" | sed 's|https\?://||;s|[/:]|_|g')
             printf "\r  ${CYAN}⠋${NC} ffuf [%d/%d] %s     " "$FFUF_COUNT" "$FFUF_TOTAL" "$host"
             timeout 300 ffuf \
                 -u "${host}/FUZZ" \
                 -w "$FFUF_WORDLIST" \
                 -mc 200,201,204,301,302,307,401,403,405 \
-                -t 50 -rate 100 \
+                -t "$FFUF_THREADS" -rate "$FFUF_RATE" \
                 -o "ffuf/${safe_host}.json" -of json \
                 -s 2>"$DEVNULL" || true
         done <<< "$FFUF_TARGETS"
 
         stop_spinner
 
-        # Merge semua hasil ffuf
         step_start "Merging ffuf results..."
         jq -r '.results[]? | "\(.status) \(.length) \(.url)"' ffuf/*.json 2>/dev/null | \
             sort -u > ffuf/all_findings.txt || true
         step_ok "ffuf findings" "$(count_lines ffuf/all_findings.txt)"
 
-        # Extract interesting paths
         grep -E "^200|^201|^204" ffuf/all_findings.txt > ffuf/found_200.txt 2>/dev/null || true
         grep -E "^401|^403" ffuf/all_findings.txt > ffuf/found_auth.txt 2>/dev/null || true
         step_info "   • 200 OK: $(count_lines ffuf/found_200.txt)"
@@ -933,7 +1077,6 @@ if command -v dalfox &>/dev/null && [ -s params/xss_candidates.txt ]; then
     XSS_TOTAL=$(count_lines params/xss_candidates.txt)
     step_info "XSS candidates: $XSS_TOTAL URLs"
 
-    # Limit ke 200 untuk efisiensi
     if [ "$XSS_TOTAL" -gt 200 ]; then
         step_info "Target besar - limit ke 200 URL teratas"
         head -200 params/xss_candidates.txt > /tmp/dalfox_input.txt
@@ -941,12 +1084,19 @@ if command -v dalfox &>/dev/null && [ -s params/xss_candidates.txt ]; then
         cp params/xss_candidates.txt /tmp/dalfox_input.txt
     fi
 
+    # ─── NOTE: dalfox tidak perlu CDN rate adjustment karena
+    # ia hanya test parameter XSS — bukan brute/crawl.
+    # Tapi kalau CDN terdeteksi, tambah --delay untuk hindari ban.
+    DALFOX_EXTRA_FLAGS=""
+    [ "$CDN_DETECTED" -eq 1 ] && DALFOX_EXTRA_FLAGS="--delay 500"
+
     step_start "dalfox - automated XSS scanning..."
     timeout 3600 dalfox file /tmp/dalfox_input.txt \
         --silence \
         --skip-bav \
         --output params/dalfox_findings.txt \
         --format plain \
+        $DALFOX_EXTRA_FLAGS \
         2>"$DEVNULL" &
     DFX_PID=$!
 
@@ -963,7 +1113,6 @@ if command -v dalfox &>/dev/null && [ -s params/xss_candidates.txt ]; then
 
     if [ "$XSS_CONFIRMED" -gt 0 ]; then
         echo -e "  ${RED}${BOLD}🚨 $XSS_CONFIRMED XSS CONFIRMED!${NC}"
-        # Notify Discord jika ada
         if [ -n "${DISCORD_WEBHOOK:-}" ]; then
             notify_critical "$TARGET" "$XSS_CONFIRMED Confirmed XSS via dalfox"
         fi
@@ -997,7 +1146,6 @@ MEDIUM=$(grep -ch "\[medium\]" nuclei/*.txt 2>"$DEVNULL" | awk '{s+=$1}END{print
 LOW=$(grep -ch "\[low\]" nuclei/*.txt 2>"$DEVNULL" | awk '{s+=$1}END{print s+0}')
 INFO=$(grep -ch "\[info\]" nuclei/*.txt 2>"$DEVNULL" | awk '{s+=$1}END{print s+0}')
 
-# Discord notify kalau ada critical findings
 if [ "${CRITICAL:-0}" -gt 0 ] && [ -n "${DISCORD_WEBHOOK:-}" ]; then
     notify_critical "$TARGET" "$CRITICAL Critical nuclei findings! Cek nuclei/*.txt segera."
 fi
@@ -1008,69 +1156,105 @@ step_start "Creating PRIORITY_FINDINGS.txt..."
     echo "║          🔥 PRIORITY FINDINGS - REVIEW FIRST             ║"
     echo "╚══════════════════════════════════════════════════════════╝"
     echo ""
-    echo "Target: $TARGET"
-    echo "Date  : $(date)"
+    echo "Target  : $TARGET"
+    echo "Date    : $(date)"
+    echo "Version : v$VERSION"
+    [ "$CDN_DETECTED" -eq 1 ] && echo "CDN/WAF : $CDN_NAMES (rate diturunkan saat scan)"
+    [ -n "$TECH_STACK" ] && echo "Tech    : $TECH_STACK"
     echo ""
-    
+
+    # ─── NEW: confidence flags ────────────────────────────────────────────────
+    echo "╔══════════════════════════════════════════════════════════╗"
+    echo "║  ℹ CONFIDENCE NOTES                                      ║"
+    echo "╚══════════════════════════════════════════════════════════╝"
+    if [ "$CDN_DETECTED" -eq 1 ]; then
+        echo "  ⚠ CDN/WAF terdeteksi ($CDN_NAMES)"
+        echo "  → Port scan & ffuf mungkin hit edge node, bukan origin"
+        echo "  → Semua temuan port/directory: VERIFIKASI MANUAL sebelum submit"
+        echo "  → Nuclei, XSS (dalfox), secrets: masih akurat karena berbasis HTTP response"
+    fi
+    echo "  → gf patterns (XSS/SQLi/SSRF): KANDIDAT saja, WAJIB verifikasi manual"
+    echo "  → IDOR: tidak ada tool yang bisa validasi IDOR otomatis, manual only"
+    echo "  → Takeover: verifikasi fingerprint secara manual sebelum report"
+    echo ""
+    # ─────────────────────────────────────────────────────────────────────────
+
     echo "═══════════════════════════════════════════════════"
-    echo "  🔴 CRITICAL FINDINGS"
+    echo "  🔴 CRITICAL FINDINGS (nuclei)"
     echo "═══════════════════════════════════════════════════"
     grep -h "\[critical\]" nuclei/*.txt 2>"$DEVNULL" || echo "  (none)"
     echo ""
-    
+
     echo "═══════════════════════════════════════════════════"
-    echo "  🟠 HIGH FINDINGS"
+    echo "  🟠 HIGH FINDINGS (nuclei)"
     echo "═══════════════════════════════════════════════════"
     grep -h "\[high\]" nuclei/*.txt 2>"$DEVNULL" || echo "  (none)"
     echo ""
-    
+
+    # ─── NEW: tech-specific findings punya section sendiri ───────────────────
+    if [ -s nuclei/06_tech_specific.txt ]; then
+        echo "═══════════════════════════════════════════════════"
+        echo "  🔧 TECH-SPECIFIC FINDINGS ($TECH_STACK)"
+        echo "═══════════════════════════════════════════════════"
+        cat nuclei/06_tech_specific.txt 2>"$DEVNULL"
+        echo ""
+    fi
+    # ─────────────────────────────────────────────────────────────────────────
+
     echo "═══════════════════════════════════════════════════"
     echo "  🎯 SUBDOMAIN TAKEOVER CANDIDATES"
+    echo "  [confidence: MEDIUM — verifikasi fingerprint manual]"
     echo "═══════════════════════════════════════════════════"
     cat takeover/*.txt 2>"$DEVNULL" || echo "  (none)"
     echo ""
-    
+
     echo "═══════════════════════════════════════════════════"
     echo "  🔐 EXPOSED SECRETS (.env, .git)"
+    echo "  [confidence: HIGH — response body match]"
     echo "═══════════════════════════════════════════════════"
     cat secrets/env_exposed.txt secrets/git_exposed.txt 2>"$DEVNULL" || echo "  (none)"
     echo ""
-    
+
     echo "═══════════════════════════════════════════════════"
     echo "  🗝️  JS SECRETS (Mantra)"
+    echo "  [confidence: MEDIUM — pattern match, verifikasi manual]"
     echo "═══════════════════════════════════════════════════"
     cat js/mantra_results.txt 2>"$DEVNULL" || echo "  (none)"
     echo ""
-    
+
     echo "═══════════════════════════════════════════════════"
     echo "  ✅ VERIFIED SECRETS (Trufflehog)"
+    echo "  [confidence: HIGH — verified by trufflehog]"
     echo "═══════════════════════════════════════════════════"
     cat js/trufflehog_verified.txt 2>"$DEVNULL" || echo "  (none)"
     echo ""
 
     echo "═══════════════════════════════════════════════════"
     echo "  🎯 CONFIRMED XSS (dalfox)"
+    echo "  [confidence: HIGH — payload executed]"
     echo "═══════════════════════════════════════════════════"
     cat params/dalfox_findings.txt 2>"$DEVNULL" || echo "  (none)"
     echo ""
 
     echo "═══════════════════════════════════════════════════"
     echo "  📂 DIRECTORY BRUTEFORCE - 200 OK (ffuf)"
+    [ "$CDN_DETECTED" -eq 1 ] && echo "  [confidence: LOW-MEDIUM — CDN detected, origin mungkin berbeda]" \
+        || echo "  [confidence: MEDIUM]"
     echo "═══════════════════════════════════════════════════"
     cat ffuf/found_200.txt 2>"$DEVNULL" || echo "  (none)"
     echo ""
 
     echo "═══════════════════════════════════════════════════"
     echo "  📂 SENSITIVE FILES EXPOSED"
+    echo "  [confidence: HIGH — 200 + regex match]"
     echo "═══════════════════════════════════════════════════"
     cat secrets/exposed_files.txt 2>"$DEVNULL" || echo "  (none)"
-    
+
 } > final/PRIORITY_FINDINGS.txt
 step_ok "Priority findings created"
 
-# JSON Report — pakai jq supaya karakter spesial di $TARGET tidak corrupt JSON
+# JSON Report
 step_start "Generating JSON report..."
-# Hitung raw_all.txt dengan aman (tidak ada di mode single)
 RAW_ALL_COUNT=$(count_lines subdomains/raw_all.txt)
 RESOLVED_COUNT=$(count_lines subdomains/resolved.txt)
 
@@ -1082,6 +1266,9 @@ jq -n \
   --arg     end_time        "$(date -d @"$END_TIME" '+%Y-%m-%d %H:%M:%S')" \
   --arg     duration_human  "${HOURS}h ${MINUTES}m ${SECONDS}s" \
   --arg     outdir          "$OUTDIR" \
+  --arg     cdn_detected    "$CDN_DETECTED" \
+  --arg     cdn_names       "$CDN_NAMES" \
+  --arg     tech_stack      "$TECH_STACK" \
   --argjson duration        "$DURATION" \
   --argjson sub_total       "$RAW_ALL_COUNT" \
   --argjson sub_resolved    "$RESOLVED_COUNT" \
@@ -1100,63 +1287,53 @@ jq -n \
   --argjson v_medium        "$MEDIUM" \
   --argjson v_low           "$LOW" \
   --argjson v_info          "$INFO" \
-  --argjson c_xss           "$(count_lines params/xss_candidates.txt)" \
-  --argjson c_sqli          "$(count_lines params/sqli_candidates.txt)" \
-  --argjson c_ssrf          "$(count_lines params/ssrf_candidates.txt)" \
-  --argjson c_lfi           "$(count_lines params/lfi_candidates.txt)" \
-  --argjson c_rce           "$(count_lines params/rce_candidates.txt)" \
-  --argjson c_redirect      "$(count_lines params/redirect_candidates.txt)" \
-  --argjson c_ssti          "$(count_lines params/ssti_candidates.txt)" \
-  --argjson c_idor          "$(count_lines params/idor_candidates.txt)" \
-  --argjson s_env           "$ENV_COUNT" \
-  --argjson s_git           "$GIT_COUNT" \
-  --argjson s_files         "$(count_lines secrets/exposed_files.txt)" \
-  --argjson takeover        "$(count_lines takeover/subzy_results.txt)" \
-  '"'"'{
-    scan_info: {
-      target: $target, mode: $mode, version: $version,
-      start_time: $start_time, end_time: $end_time,
-      duration_seconds: $duration, duration_human: $duration_human,
-      output_directory: $outdir
-    },
-    statistics: {
-      subdomains: { total_found: $sub_total, resolved: $sub_resolved, in_scope: $sub_inscope },
-      live_hosts: { total: $live_total, status_200: $live_200, status_403_401: $live_403, status_5xx: $live_5xx },
-      urls: { total_deduped: $urls_dedup, js_files: $urls_js, live_js: $urls_live_js, with_params: $urls_params, interesting_files: $urls_interesting },
-      vulnerabilities: { critical: $v_critical, high: $v_high, medium: $v_medium, low: $v_low, info: $v_info },
-      vuln_candidates: { xss: $c_xss, sqli: $c_sqli, ssrf: $c_ssrf, lfi: $c_lfi, rce: $c_rce, open_redirect: $c_redirect, ssti: $c_ssti, idor: $c_idor },
-      secrets: { env_exposed: $s_env, git_exposed: $s_git, sensitive_files: $s_files },
-      takeover_candidates: $takeover
-    },
-    priority_files: {
-      critical_findings: "final/PRIORITY_FINDINGS.txt",
-      all_subdomains: "subdomains/all_subdomains.txt",
-      live_urls: "live/live_urls.txt",
-      nuclei_results: "nuclei/", js_secrets: "js/", params_for_manual: "params/"
-    }
-  }'"'"' > final/report.json
+  --argjson xss_candidates  "$(count_lines params/xss_candidates.txt)" \
+  --argjson xss_confirmed   "$(count_lines params/dalfox_findings.txt)" \
+  --argjson sqli_candidates "$(count_lines params/sqli_candidates.txt)" \
+  --argjson ssrf_candidates "$(count_lines params/ssrf_candidates.txt)" \
+  --argjson lfi_candidates  "$(count_lines params/lfi_candidates.txt)" \
+  --argjson rce_candidates  "$(count_lines params/rce_candidates.txt)" \
+  --argjson takeover_count  "$(count_lines takeover/subzy_results.txt)" \
+  --argjson env_exposed     "$ENV_COUNT" \
+  --argjson git_exposed     "$GIT_COUNT" \
+  '{
+    meta: {target: $target, mode: $mode, version: $version,
+           start_time: $start_time, end_time: $end_time,
+           duration_seconds: $duration, duration_human: $duration_human,
+           output_dir: $outdir,
+           cdn: {detected: ($cdn_detected == "1"), names: $cdn_names},
+           tech_stack: $tech_stack},
+    assets: {subdomains: {total_raw: $sub_total, resolved: $sub_resolved, in_scope: $sub_inscope},
+             live_hosts: {total: $live_total, status_200: $live_200, status_403: $live_403, status_5xx: $live_5xx},
+             urls: {dedup: $urls_dedup, js_files: $urls_js, live_js: $urls_live_js,
+                    with_params: $urls_params, interesting: $urls_interesting}},
+    vulnerabilities: {critical: $v_critical, high: $v_high, medium: $v_medium, low: $v_low, info: $v_info},
+    attack_surface: {xss: {candidates: $xss_candidates, confirmed: $xss_confirmed},
+                     sqli_candidates: $sqli_candidates, ssrf_candidates: $ssrf_candidates,
+                     lfi_candidates: $lfi_candidates, rce_candidates: $rce_candidates,
+                     takeover_candidates: $takeover_count,
+                     secrets: {env_exposed: $env_exposed, git_exposed: $git_exposed}}
+  }' > final/report.json
 step_ok "JSON report"
 
 # HTML Report
 step_start "Generating HTML report..."
 cat > final/report.html << HTMLEOF
 <!DOCTYPE html>
-<html>
+<html lang="id">
 <head>
-<title>Recon Report - $TARGET</title>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Bug Hunter Recon Report v$VERSION - $TARGET</title>
 <style>
-body{font-family:-apple-system,Arial,sans-serif;background:#0d1117;color:#c9d1d9;padding:30px;max-width:1400px;margin:auto;line-height:1.6}
-h1{color:#58a6ff;border-bottom:2px solid #30363d;padding-bottom:15px}
-h2{color:#7ee787;margin-top:35px;border-left:4px solid #7ee787;padding-left:12px}
-.card{background:#161b22;padding:20px;margin:15px 0;border-radius:10px;border:1px solid #30363d}
-.critical{border-left:5px solid #ff6b6b;background:#1f1215}
-.high{border-left:5px solid #ffa657}
-.medium{border-left:5px solid #ffd43b}
-.low{border-left:5px solid #79c0ff}
-.info{border-left:5px solid #8b949e}
-.ok{border-left:5px solid #7ee787}
-table{width:100%;border-collapse:collapse;margin:15px 0;background:#161b22;border-radius:8px;overflow:hidden}
-th,td{padding:12px 15px;text-align:left;border-bottom:1px solid #30363d}
+body{font-family:'Segoe UI',sans-serif;background:#0d1117;color:#c9d1d9;margin:0;padding:20px}
+h1,h2{color:#7ee787}
+.card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:20px;margin:15px 0}
+.ok{border-left:4px solid #238636}
+.warn{border-left:4px solid #d29922}
+.critical{border-left:4px solid #da3633}
+table{width:100%;border-collapse:collapse;margin:10px 0}
+td,th{padding:10px;border:1px solid #30363d;text-align:left}
 th{background:#21262d;color:#7ee787;font-weight:600}
 tr:hover{background:#1c2128}
 .num{font-size:32px;font-weight:bold;color:#7ee787}
@@ -1166,6 +1343,7 @@ tr:hover{background:#1c2128}
 .b-high{background:#ffa657;color:#000}
 .b-med{background:#ffd43b;color:#000}
 .b-low{background:#79c0ff;color:#000}
+.b-cdn{background:#d29922;color:#000}
 code{background:#1c2128;padding:2px 6px;border-radius:4px;color:#f0883e}
 ul{line-height:2}
 .emoji{font-size:24px;margin-right:10px}
@@ -1180,6 +1358,8 @@ ul{line-height:2}
 <strong>⏱️  Duration:</strong> ${HOURS}h ${MINUTES}m ${SECONDS}s<br>
 <strong>📅 Date:</strong> $(date)<br>
 <strong>📁 Output:</strong> <code>$OUTDIR</code>
+$([ -n "$TECH_STACK" ] && echo "<br><strong>🔧 Tech Stack:</strong> <code>$TECH_STACK</code>")
+$([ "$CDN_DETECTED" -eq 1 ] && echo "<br><strong>⚠️ CDN/WAF:</strong> <span class='badge b-cdn'>$CDN_NAMES</span> — verifikasi port scan & ffuf secara manual")
 </div>
 
 <h2>📊 Quick Stats</h2>
@@ -1195,35 +1375,37 @@ ul{line-height:2}
 <tr><th>Severity</th><th>Count</th><th>Priority</th></tr>
 <tr class="critical"><td><span class="emoji">🔴</span>Critical</td><td class="num">$CRITICAL</td><td><span class="badge b-crit">REVIEW NOW</span></td></tr>
 <tr class="high"><td><span class="emoji">🟠</span>High</td><td class="num">$HIGH</td><td><span class="badge b-high">HIGH PRIORITY</span></td></tr>
-<tr class="medium"><td><span class="emoji">🟡</span>Medium</td><td class="num">$MEDIUM</td><td><span class="badge b-med">MEDIUM</span></td></tr>
-<tr class="low"><td><span class="emoji">🔵</span>Low</td><td class="num">$LOW</td><td><span class="badge b-low">LOW</span></td></tr>
-<tr class="info"><td><span class="emoji">⚪</span>Info</td><td class="num">$INFO</td><td>Informational</td></tr>
+<tr><td><span class="emoji">🟡</span>Medium</td><td class="num">$MEDIUM</td><td><span class="badge b-med">MEDIUM</span></td></tr>
+<tr><td><span class="emoji">🔵</span>Low</td><td class="num">$LOW</td><td><span class="badge b-low">LOW</span></td></tr>
+<tr><td><span class="emoji">⚪</span>Info</td><td class="num">$INFO</td><td>Informational</td></tr>
 </table>
 
 <h2>🎯 Attack Surface Summary</h2>
 <table>
-<tr><th>Type</th><th>Count</th><th>Test With</th></tr>
-<tr><td>🎯 XSS Candidates</td><td>$(count_lines params/xss_candidates.txt)</td><td><code>dalfox</code></td></tr>
-<tr><td>💉 SQLi Candidates</td><td>$(count_lines params/sqli_candidates.txt)</td><td><code>sqlmap</code></td></tr>
-<tr><td>🌐 SSRF Candidates</td><td>$(count_lines params/ssrf_candidates.txt)</td><td>Manual + Collab</td></tr>
-<tr><td>📂 LFI Candidates</td><td>$(count_lines params/lfi_candidates.txt)</td><td>Manual / ffuf</td></tr>
-<tr><td>⚡ RCE Candidates</td><td>$(count_lines params/rce_candidates.txt)</td><td>Manual</td></tr>
-<tr><td>↪️ Open Redirect</td><td>$(count_lines params/redirect_candidates.txt)</td><td>Manual</td></tr>
-<tr><td>📝 SSTI Candidates</td><td>$(count_lines params/ssti_candidates.txt)</td><td>Manual</td></tr>
-<tr><td>🔓 IDOR Candidates</td><td>$(count_lines params/idor_candidates.txt)</td><td>Manual (wajib!)</td></tr>
-<tr class="critical"><td>🎯 Takeover Candidates</td><td>$(count_lines takeover/subzy_results.txt)</td><td><code>subzy + manual</code></td></tr>
-<tr class="critical"><td>🔐 .env Exposed</td><td>$ENV_COUNT</td><td>Curl + verify</td></tr>
-<tr class="critical"><td>🔐 .git Exposed</td><td>$GIT_COUNT</td><td><code>git-dumper</code></td></tr>
+<tr><th>Type</th><th>Count</th><th>Confidence</th><th>Test With</th></tr>
+<tr><td>🎯 XSS Candidates</td><td>$(count_lines params/xss_candidates.txt)</td><td>Low (perlu verifikasi)</td><td><code>dalfox</code></td></tr>
+<tr class="ok"><td>✅ XSS Confirmed</td><td>$(count_lines params/dalfox_findings.txt)</td><td>High (dalfox confirmed)</td><td>Submit!</td></tr>
+<tr><td>💉 SQLi Candidates</td><td>$(count_lines params/sqli_candidates.txt)</td><td>Low (perlu verifikasi)</td><td><code>sqlmap</code></td></tr>
+<tr><td>🌐 SSRF Candidates</td><td>$(count_lines params/ssrf_candidates.txt)</td><td>Low</td><td>Manual + Collab</td></tr>
+<tr><td>📂 LFI Candidates</td><td>$(count_lines params/lfi_candidates.txt)</td><td>Low</td><td>Manual / ffuf</td></tr>
+<tr><td>⚡ RCE Candidates</td><td>$(count_lines params/rce_candidates.txt)</td><td>Low</td><td>Manual</td></tr>
+<tr><td>↪️ Open Redirect</td><td>$(count_lines params/redirect_candidates.txt)</td><td>Low</td><td>Manual</td></tr>
+<tr><td>📝 SSTI Candidates</td><td>$(count_lines params/ssti_candidates.txt)</td><td>Low</td><td>Manual</td></tr>
+<tr><td>🔓 IDOR Candidates</td><td>$(count_lines params/idor_candidates.txt)</td><td>Low (manual only!)</td><td>Manual (wajib!)</td></tr>
+<tr class="critical"><td>🎯 Takeover Candidates</td><td>$(count_lines takeover/subzy_results.txt)</td><td>Medium</td><td><code>subzy + manual</code></td></tr>
+<tr class="critical"><td>🔐 .env Exposed</td><td>$ENV_COUNT</td><td>High</td><td>Curl + verify</td></tr>
+<tr class="critical"><td>🔐 .git Exposed</td><td>$GIT_COUNT</td><td>High</td><td><code>git-dumper</code></td></tr>
 </table>
 
 <h2>📁 File Locations</h2>
 <div class="card ok">
 <ul>
-<li>🔥 <code>final/PRIORITY_FINDINGS.txt</code> - <strong>BACA INI PERTAMA!</strong></li>
+<li>🔥 <code>final/PRIORITY_FINDINGS.txt</code> - <strong>BACA INI PERTAMA! (dengan confidence notes)</strong></li>
 <li>📊 <code>final/report.json</code> - Machine-readable report</li>
 <li>🌐 <code>subdomains/all_subdomains.txt</code> - All subdomains</li>
 <li>✅ <code>live/live_urls.txt</code> - Live hosts</li>
 <li>⚔️ <code>nuclei/</code> - All vulnerability findings</li>
+<li>🔧 <code>nuclei/06_tech_specific.txt</code> - Tech-aware findings</li>
 <li>🔐 <code>js/</code> - JS secrets & endpoints</li>
 <li>🎯 <code>params/</code> - Categorized URLs for manual testing</li>
 <li>📸 <code>screenshots/</code> - Visual recon</li>
@@ -1233,7 +1415,7 @@ ul{line-height:2}
 <h2>💡 Next Steps (Manual Testing)</h2>
 <div class="card">
 <ol>
-<li><strong>Review <code>PRIORITY_FINDINGS.txt</code></strong> - validasi setiap finding secara manual</li>
+<li><strong>Review <code>PRIORITY_FINDINGS.txt</code></strong> - perhatikan confidence level tiap section</li>
 <li>Check verified secrets di <code>js/trufflehog_verified.txt</code></li>
 <li>Test XSS: <code>dalfox file params/xss_candidates.txt</code></li>
 <li>Test SQLi: <code>sqlmap -m params/sqli_candidates.txt --batch</code></li>
@@ -1241,27 +1423,8 @@ ul{line-height:2}
 <li>Review screenshots untuk spot visual anomaly</li>
 <li>Exploit .git jika exposed: <code>git-dumper http://target.com/.git/ ./loot</code></li>
 <li>Manual IDOR testing pada <code>params/idor_candidates.txt</code></li>
+$([ "$CDN_DETECTED" -eq 1 ] && echo "<li>🔍 <strong>CDN detected:</strong> Cari origin IP via <code>Shodan: ssl.cert.subject.cn:$TARGET</code></li>")
 </ol>
-</div>
-
-<h2>📚 Useful Commands</h2>
-<div class="card">
-<pre style="background:#1c2128;padding:15px;border-radius:8px;overflow-x:auto">
-# Filter critical findings
-grep -h "[critical]" nuclei/*.txt
-
-# Test XSS candidates
-dalfox file params/xss_candidates.txt --silence
-
-# Download .git jika exposed
-git-dumper http://target.com/.git/ ./dumped-repo
-
-# SQLmap batch test
-sqlmap -m params/sqli_candidates.txt --batch --risk=2
-
-# Check takeover manually
-cat takeover/subzy_results.txt
-</pre>
 </div>
 
 <p style="text-align:center;margin-top:40px;color:#8b949e">
@@ -1285,12 +1448,15 @@ echo -e "${GREEN}║              ✓ RECON COMPLETE! 🎉                      
 echo -e "${GREEN}╚═══════════════════════════════════════════════════════════╝${NC}"
 echo ""
 
-# Full stats box
 echo -e "${BOLD}${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo -e "${BOLD}${CYAN}  📊 FINAL STATISTICS${NC}"
 echo -e "${BOLD}${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 printf "  ⏱️  %-25s ${WHITE}%s${NC}\n" "Total Duration:" "${HOURS}h ${MINUTES}m ${SECONDS}s"
 printf "  📁 %-25s ${WHITE}%s${NC}\n" "Output:" "$OUTDIR"
+
+[ "$CDN_DETECTED" -eq 1 ] && printf "  ⚠️  %-25s ${YELLOW}%s${NC}\n" "CDN/WAF:" "$CDN_NAMES"
+[ -n "$TECH_STACK" ] && printf "  🔧 %-25s ${WHITE}%s${NC}\n" "Tech Stack:" "$TECH_STACK"
+
 echo ""
 echo -e "${BOLD}  🌐 ASSET DISCOVERY${NC}"
 printf "     %-25s ${WHITE}%s${NC}\n" "Subdomains:" "$(count_lines subdomains/all_subdomains.txt)"
@@ -1307,6 +1473,7 @@ printf "     %-25s %s\n" "⚪ Info:" "$INFO"
 echo ""
 echo -e "${BOLD}  🎯 ATTACK SURFACE${NC}"
 printf "     %-25s ${WHITE}%s${NC}\n" "XSS candidates:" "$(count_lines params/xss_candidates.txt)"
+printf "     %-25s ${WHITE}%s${NC}\n" "XSS confirmed:" "$(count_lines params/dalfox_findings.txt)"
 printf "     %-25s ${WHITE}%s${NC}\n" "SQLi candidates:" "$(count_lines params/sqli_candidates.txt)"
 printf "     %-25s ${WHITE}%s${NC}\n" "SSRF candidates:" "$(count_lines params/ssrf_candidates.txt)"
 printf "     %-25s ${WHITE}%s${NC}\n" "LFI candidates:" "$(count_lines params/lfi_candidates.txt)"
@@ -1324,10 +1491,10 @@ echo ""
 echo -e "${BOLD}${MAGENTA}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo -e "${BOLD}${GREEN}  📋 NEXT STEPS${NC}"
 echo -e "${BOLD}${MAGENTA}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${CYAN}  1.${NC} Review priority findings:"
+echo -e "${CYAN}  1.${NC} Review priority findings (dengan confidence notes):"
 echo -e "     ${YELLOW}cat $OUTDIR/final/PRIORITY_FINDINGS.txt${NC}"
 echo ""
-echo -e "${CYAN}  2.${NC} Open HTML report in browser:"
+echo -e "${CYAN}  2.${NC} Open HTML report:"
 echo -e "     ${YELLOW}xdg-open $OUTDIR/final/report.html${NC}"
 echo ""
 echo -e "${CYAN}  3.${NC} Check verified secrets:"
@@ -1338,14 +1505,17 @@ echo -e "     ${YELLOW}dalfox file $OUTDIR/params/xss_candidates.txt${NC}"
 echo ""
 echo -e "${CYAN}  5.${NC} Manual test SQLi candidates:"
 echo -e "     ${YELLOW}sqlmap -m $OUTDIR/params/sqli_candidates.txt --batch${NC}"
-echo ""
-echo -e "${CYAN}  6.${NC} Check takeover candidates manually:"
-echo -e "     ${YELLOW}cat $OUTDIR/takeover/subzy_results.txt${NC}"
+
+if [ "$CDN_DETECTED" -eq 1 ]; then
+    echo ""
+    echo -e "${YELLOW}${BOLD}  ⚠️  CDN DETECTED — cari origin IP dulu:${NC}"
+    echo -e "     ${YELLOW}Shodan: ssl.cert.subject.cn:$TARGET${NC}"
+    echo -e "     ${YELLOW}Censys: parsed.names: $TARGET${NC}"
+fi
 
 if [ $GIT_COUNT -gt 0 ]; then
     echo ""
     echo -e "${RED}${BOLD}  🚨 URGENT:${NC} .git exposed di $GIT_COUNT target!"
-    echo -e "     Dump source code dengan:"
     echo -e "     ${YELLOW}git-dumper http://target/.git/ ./dump${NC}"
 fi
 
